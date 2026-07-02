@@ -1,0 +1,21 @@
+{
+  "rules": [
+    {
+      "endpoint": "/api/resource",
+      "algorithm": "token_bucket",
+      "capacity": 5,
+      "refill_rate": 1
+    },
+    {
+      "endpoint": "/api/search",
+      "algorithm": "token_bucket",
+      "capacity": 20,
+      "refill_rate": 5
+    }
+  ],
+  "default": {
+    "algorithm": "token_bucket",
+    "capacity": 10,
+    "refill_rate": 2
+  }
+}
