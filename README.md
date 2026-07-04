@@ -6,7 +6,7 @@ operations. Built step by step to demonstrate the core distributed-systems
 challenge in rate limiting: coordinating state across multiple servers
 without race conditions.
 
-## Status: Step 0 complete
+## Status: Steps 0-8 complete
 
 - [x] Step 0 — Project skeleton, FastAPI app, Docker setup
 - [x] Step 1 — In-memory Token Bucket algorithm + unit tests
@@ -81,11 +81,11 @@ default.
 Rate limits are now config-driven (`config/rate_limit_config.json`) and
 apply along two independent dimensions:
 
-**Per-endpoint:** `/api/resource` (capacity=5) and `/api/search`
-(capacity=20) have independently configured limits. Exhausting one
-endpoint's bucket doesn't affect the other - verified by exhausting
-`/api/resource` (5 requests, 6th returns 429) and immediately getting
-a `200` from `/api/search`.
+**Per-endpoint:** `/api/resource` (Token Bucket, capacity=5) and
+`/api/search` (Sliding Window, limit=10 per 5s) have independently
+configured limits. Exhausting one endpoint's bucket doesn't affect the
+other - verified by exhausting `/api/resource` (5 requests, 6th
+returns 429) and immediately getting a `200` from `/api/search`.
 
 **Per-identity:** clients are identified by API key (`X-API-Key`
 header) if present, otherwise by IP. An API-key client and an
@@ -259,10 +259,25 @@ This starts both the service (port 8080) and Redis (port 6379).
 ```
 rate-limiter-py/
 ├── requirements.txt
-├── docker-compose.yml     # App + Redis
-├── docker/Dockerfile       # Service container
+├── docker-compose.yml           # App + Redis
+├── docker/Dockerfile             # Service container
+├── config/
+│   └── rate_limit_config.json    # Per-endpoint algorithm + limits + fail_mode
 ├── app/
-│   ├── __init__.py
-│   └── main.py             # Entry point
-└── tests/                  # Unit tests
+│   ├── main.py                   # Entry point, route definitions
+│   ├── middleware/
+│   │   └── rate_limit.py         # Ties config + strategy + client ID together
+│   └── core/
+│       ├── token_bucket.py               # Step 1: in-memory algorithm
+│       ├── redis_token_bucket_naive.py   # Step 3: deliberately unsafe (teaching artifact)
+│       ├── redis_token_bucket_atomic.py  # Step 4: atomic fix via Lua
+│       ├── sliding_window_counter.py     # Step 6: second algorithm
+│       ├── strategy.py                   # Step 6: strategy pattern
+│       └── rate_limit_config.py          # Step 5: config loader
+└── tests/
+    ├── test_token_bucket.py           # Step 1: unit tests
+    ├── demonstrate_race_condition.py  # Step 3: proves the bug
+    ├── verify_atomic_fix.py           # Step 4: proves the fix
+    ├── verify_sliding_window.py       # Step 6: concurrency test
+    └── benchmark.py                   # Step 8: latency/accuracy/memory report
 ```
