@@ -1,16 +1,17 @@
 """
 Rate limiting middleware for FastAPI.
 
-As of Step 5, this supports multi-dimensional limits:
-  - Per-endpoint limits, loaded from config/rate_limit_config.json
-  - Per-client identity: an API key (X-API-Key header) if present,
-    otherwise falls back to client IP
+As of Step 7, this also handles Redis being unreachable. Each rule
+specifies a fail_mode ("open" or "closed") in config:
+  - fail_mode="open":   if Redis is down, let the request through.
+                        Prioritizes availability over strict enforcement.
+  - fail_mode="closed": if Redis is down, reject the request (503).
+                        Prioritizes strict enforcement over availability.
 
-Each (client, endpoint) pair gets its own independent bucket - so a
-client hitting /api/resource and /api/search doesn't share one limit
-across both, and an API-key client is tracked separately from an
-anonymous IP-based client even if they happen to share an IP (e.g.
-behind NAT or a shared office network).
+Different endpoints can reasonably choose differently - a cheap read
+endpoint might fail open (staying up matters more than perfect limits
+for a few minutes), while something protecting an expensive or abusable
+resource might fail closed (better to be unavailable than unprotected).
 """
 
 import math
@@ -20,8 +21,8 @@ from fastapi import Request
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from app.core.redis_token_bucket_atomic import RedisTokenBucketAtomic
-from app.core.rate_limit_config import RateLimitConfig, load_default_config
+from app.core.rate_limit_config import RateLimitConfig, RateLimitRule, load_default_config
+from app.core.strategy import RateLimitStrategy, build_strategy
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
@@ -34,17 +35,33 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
     ):
         super().__init__(app)
         self.config = config or load_default_config()
+        # Short socket timeout so a dead Redis fails fast (within ~1s)
+        # instead of hanging the request while retrying/waiting.
+        self.redis_client = redis.Redis(
+            host=redis_host,
+            port=redis_port,
+            decode_responses=False,
+            socket_connect_timeout=1,
+            socket_timeout=1,
+        )
 
-        redis_client = redis.Redis(host=redis_host, port=redis_port, decode_responses=False)
-        self.bucket = RedisTokenBucketAtomic(redis_client)
+        # Cache one strategy instance per distinct rule, rather than
+        # rebuilding it (and re-registering its Lua script) on every request.
+        self._strategy_cache: dict[str, RateLimitStrategy] = {}
+
+    def _get_strategy(self, rule: RateLimitRule) -> RateLimitStrategy:
+        cache_key = f"{rule.algorithm}:{rule.params}"
+        if cache_key not in self._strategy_cache:
+            self._strategy_cache[cache_key] = build_strategy(
+                self.redis_client, rule.algorithm, rule.params
+            )
+        return self._strategy_cache[cache_key]
 
     def _get_client_id(self, request: Request) -> str:
         """
         Prefer an API key if the client sent one - API-key clients get
-        tracked as a stable identity regardless of IP, which matters for
-        clients behind NAT, mobile networks, or proxies where IP isn't
-        a reliable per-client signal. Falls back to IP for anonymous
-        traffic.
+        tracked as a stable identity regardless of IP. Falls back to IP
+        for anonymous traffic.
         """
         api_key = request.headers.get("X-API-Key")
         if api_key:
@@ -63,34 +80,58 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         rule = self.config.resolve(path)
+        strategy = self._get_strategy(rule)
         client_id = self._get_client_id(request)
 
         # Bucket is keyed by BOTH client and endpoint, so limits on
         # different endpoints don't share state for the same client.
         bucket_id = f"{client_id}:{path}"
 
-        allowed, remaining = self.bucket.allow_request(
-            bucket_id, capacity=rule.capacity, refill_rate=rule.refill_rate
-        )
+        try:
+            allowed, info = strategy.allow_request(bucket_id)
+        except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError) as e:
+            return await self._handle_redis_failure(request, call_next, rule, path, e)
 
         if not allowed:
-            tokens_needed = 1 - remaining
-            retry_after = math.ceil(tokens_needed / rule.refill_rate) if rule.refill_rate > 0 else 1
-
             return JSONResponse(
                 status_code=429,
                 content={
                     "error": "Too Many Requests",
-                    "message": f"Rate limit exceeded for {path}. Try again in {retry_after} second(s).",
+                    "message": f"Rate limit exceeded for {path} (algorithm: {rule.algorithm}).",
                 },
                 headers={
-                    "X-RateLimit-Limit": str(rule.capacity),
+                    "X-RateLimit-Limit": str(info["limit"]),
                     "X-RateLimit-Remaining": "0",
-                    "Retry-After": str(retry_after),
+                    "X-RateLimit-Algorithm": rule.algorithm,
                 },
             )
 
         response = await call_next(request)
-        response.headers["X-RateLimit-Limit"] = str(rule.capacity)
-        response.headers["X-RateLimit-Remaining"] = str(math.floor(remaining))
+        response.headers["X-RateLimit-Limit"] = str(info["limit"])
+        response.headers["X-RateLimit-Remaining"] = str(math.floor(info["remaining"]))
+        response.headers["X-RateLimit-Algorithm"] = rule.algorithm
         return response
+
+    async def _handle_redis_failure(self, request: Request, call_next, rule: RateLimitRule, path: str, error: Exception):
+        """
+        Redis is unreachable. Apply this rule's configured fail_mode.
+        """
+        if rule.fail_mode == "open":
+            # Let the request through, but say so explicitly via a header -
+            # silently degrading protection should never be invisible.
+            response = await call_next(request)
+            response.headers["X-RateLimit-Status"] = "degraded-fail-open"
+            return response
+
+        # fail_mode == "closed": reject rather than risk unprotected traffic.
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": "Service Unavailable",
+                "message": (
+                    f"Rate limiting backend is unreachable and {path} is configured "
+                    "to fail closed. Request rejected rather than risk exceeding limits."
+                ),
+            },
+            headers={"X-RateLimit-Status": "degraded-fail-closed"},
+        )

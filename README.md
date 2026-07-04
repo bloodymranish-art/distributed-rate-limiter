@@ -14,9 +14,9 @@ without race conditions.
 - [x] Step 3 — Naive Redis-backed state (and the race condition it causes)
 - [x] Step 4 — Atomic fix via Redis Lua scripting
 - [x] Step 5 — Multi-dimensional limits (per-user/IP/API-key/endpoint config)
-- [ ] Step 6 — Sliding Window Counter algorithm, swappable via strategy pattern
-- [ ] Step 7 — Fail-open vs fail-closed behavior
-- [ ] Step 8 — Load testing + benchmark report (latency, memory, accuracy)
+- [x] Step 6 — Sliding Window Counter algorithm, swappable via strategy pattern
+- [x] Step 7 — Fail-open vs fail-closed behavior
+- [x] Step 8 — Load testing + benchmark report (latency, memory, accuracy)
 - [ ] Step 9 — Observability / metrics endpoint
 
 ## Why this exists
@@ -99,6 +99,127 @@ Adding a new endpoint-specific limit means editing the JSON config,
 not touching middleware code - mirrors how real API gateways (Kong,
 Envoy, AWS API Gateway) configure per-route limits without
 redeploying code.
+
+## Two algorithms, swappable via config (Step 6)
+
+`/api/resource` uses Token Bucket; `/api/search` uses Sliding Window
+Counter (`app/core/sliding_window_counter.py`) - chosen purely by
+`config/rate_limit_config.json`, with zero if/else branching in the
+middleware itself (`app/core/strategy.py` implements the strategy
+pattern that makes this possible).
+
+**Why Sliding Window Counter matters:** it's the algorithm most
+production systems actually use, because it fixes Fixed Window
+Counter's flaw (up to 2x the limit right at a window boundary) at O(1)
+memory cost - unlike Sliding Window Log, which is perfectly accurate
+but stores every request timestamp.
+
+**Verified correctness under concurrency**
+(`tests/verify_sliding_window.py`), same rigor as the Token Bucket
+atomicity fix in Step 4 - 30 concurrent requests against a limit of 5:
+
+```
+Trial 1: 5 requests allowed out of 30  -> correct
+Trial 2: 5 requests allowed out of 30  -> correct
+Trial 3: 5 requests allowed out of 30  -> correct
+Trial 4: 5 requests allowed out of 30  -> correct
+Trial 5: 5 requests allowed out of 30  -> correct
+```
+
+**Verified live, side by side, through the actual HTTP server:**
+`/api/resource` (Token Bucket, capacity=5) allowed exactly 5 before
+returning 429; `/api/search` (Sliding Window, limit=10 per 5s)
+allowed exactly 10, with `X-RateLimit-Remaining` counting down
+accurately on both, and `X-RateLimit-Algorithm` confirming which
+algorithm handled each request.
+
+## Fail-open vs fail-closed (Step 7)
+
+Each endpoint's config specifies a `fail_mode`: what should happen if
+Redis itself is unreachable.
+
+- `fail_mode: "open"` - let requests through if Redis is down.
+  Prioritizes availability. Used on `/api/resource`.
+- `fail_mode: "closed"` - reject requests (503) if Redis is down.
+  Prioritizes strict enforcement, at the cost of availability. Used
+  on `/api/search`.
+
+Both were verified against a **real Redis outage** (not simulated):
+Redis was killed mid-session, then both endpoints were hit, then
+Redis was restarted.
+
+```
+Redis killed.
+
+GET /api/resource (fail_mode=open):
+  200 OK, X-RateLimit-Status: degraded-fail-open
+  -> request succeeded despite Redis being down, and said so explicitly
+
+GET /api/search (fail_mode=closed):
+  503 Service Unavailable, X-RateLimit-Status: degraded-fail-closed
+  -> request rejected rather than risk unprotected traffic
+
+Redis restarted.
+
+GET /api/search again:
+  200 OK, back to normal
+  -> recovered automatically, no restart or manual reset needed
+```
+
+A degraded response is never silent - both paths set an
+`X-RateLimit-Status` header so a caller (or an on-call engineer) can
+tell protection is currently down, rather than just seeing normal
+-looking traffic during an outage.
+
+## Benchmark report (Step 8)
+
+Measured with `tests/benchmark.py` against the live HTTP service (not
+the algorithms in isolation), covering latency, accuracy under
+concurrency, and Redis memory cost. Run yourself with:
+
+```bash
+python tests/benchmark.py
+```
+
+*(Requires the server and Redis running. Numbers below are from a
+single local run - absolute latency is hardware/environment
+dependent, but the comparison between algorithms and the correctness
+results are the meaningful takeaways.)*
+
+### Latency (100 requests, concurrency=20)
+
+| Algorithm       | Endpoint       | p50    | p95    | p99     | min   | max     |
+|-----------------|----------------|--------|--------|---------|-------|---------|
+| Token Bucket    | /api/resource  | 31.8ms | 97.4ms | 131.2ms | 9.8ms | 144.0ms |
+| Sliding Window  | /api/search    | 31.4ms | 99.8ms | 121.1ms | 10.7ms| 190.9ms |
+
+Both algorithms perform comparably - expected, since in both cases the
+dominant cost is one round trip executing a Redis Lua script, not the
+O(1) arithmetic each script does. The algorithm choice is a
+correctness/memory tradeoff (see below), not a latency one.
+
+### Accuracy under concurrency (50 concurrent requests, fresh bucket)
+
+| Algorithm       | Endpoint       | Expected allowed | Actual allowed | Result  |
+|-----------------|----------------|-------------------|-----------------|---------|
+| Token Bucket    | /api/resource  | 5                 | 5               | CORRECT |
+| Sliding Window  | /api/search    | 10                | 10              | CORRECT |
+
+Both hold exactly at their configured limit under real concurrent HTTP
+load - not just in the isolated unit tests from Steps 4 and 6, but
+through the full HTTP + middleware + Redis path.
+
+### Redis memory footprint (per client)
+
+| Algorithm       | Storage                          | Bytes per client            |
+|-----------------|-----------------------------------|------------------------------|
+| Token Bucket    | 1 Redis hash key                 | 136 bytes                   |
+| Sliding Window  | 2 window keys (current+previous) | ~176 bytes (88 bytes each)  |
+
+Sliding Window costs slightly more memory per client (needs two window
+counters instead of one bucket), which is the real-world price of its
+better boundary-accuracy - a concrete number to cite instead of a
+hand-wavy "more memory."
 
 ## Stack
 

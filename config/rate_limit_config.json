@@ -4,18 +4,21 @@
       "endpoint": "/api/resource",
       "algorithm": "token_bucket",
       "capacity": 5,
-      "refill_rate": 1
+      "refill_rate": 1,
+      "fail_mode": "open"
     },
     {
       "endpoint": "/api/search",
-      "algorithm": "token_bucket",
-      "capacity": 20,
-      "refill_rate": 5
+      "algorithm": "sliding_window",
+      "limit": 10,
+      "window_size_seconds": 5,
+      "fail_mode": "closed"
     }
   ],
   "default": {
     "algorithm": "token_bucket",
     "capacity": 10,
-    "refill_rate": 2
+    "refill_rate": 2,
+    "fail_mode": "open"
   }
 }
